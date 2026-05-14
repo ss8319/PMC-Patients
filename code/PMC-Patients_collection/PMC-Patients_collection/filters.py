@@ -1,6 +1,10 @@
+import argparse
 import json
 import re
 import os
+from multiprocessing import Pool
+from pathlib import Path
+
 from tqdm import trange, tqdm
 from word2number import w2n
 
@@ -199,44 +203,162 @@ def length_filter(case):
     return len(case.strip().split()) >= 10
 
 
+def _filter_one_record(dat):
+    """
+    Per-record CPU work (safe to run in parallel). Returns:
+      ('length'|'en'|'demo', None) on reject, ('ok', enriched_dict) on pass.
+    demo_filter is called once per passing row.
+    """
+    patient = dat.get("patient") or ""
+    if not length_filter(patient):
+        return ("length", None)
+    if not en_filter(patient):
+        return ("en", None)
+    demo = demo_filter(patient)
+    if not demo:
+        return ("demo", None)
+    age, gender = demo
+    out = dict(dat)
+    out["age"] = age
+    out["gender"] = gender
+    return ("ok", out)
+
+
+# ═══════════════════════════════════════════════════════════
+# Schema-conformance helpers (case_schema_v0.1.json)
+# ═══════════════════════════════════════════════════════════
+
+# Map "year"/"month"/etc. → divisor to convert to years.
+_AGE_UNIT_TO_YEARS = {
+    "year": 1.0,
+    "month": 1.0 / 12.0,
+    "week": 1.0 / 52.1429,
+    "day": 1.0 / 365.25,
+    "hour": 1.0 / (365.25 * 24),
+}
+
+
+def _normalize_license(raw):
+    """PMC OA metadata uses 'CC BY' (space); schema enum uses 'CC-BY' (hyphen).
+    Returns None for unrecognized values (downstream renderer can decide)."""
+    if not raw:
+        return None
+    canon = raw.strip().replace(" ", "-")
+    allowed = {"CC-BY", "CC-BY-SA", "CC-BY-NC", "CC-BY-NC-SA", "CC0"}
+    return canon if canon in allowed else None
+
+
+def _age_to_years(age_tuples):
+    """Convert PMC-Patients' [[value, unit], ...] to a single age_years float.
+    First tuple wins; sums any same-row mixed units (e.g. '3 years and 2 months')."""
+    if not age_tuples:
+        return None
+    total = 0.0
+    for value, unit in age_tuples:
+        factor = _AGE_UNIT_TO_YEARS.get(unit)
+        if factor is None:
+            return None
+        total += float(value) * factor
+    return round(total, 3)
+
+
+def _normalize_sex(raw):
+    """Schema sex enum: 'male' / 'female' / 'other' / null."""
+    if not raw:
+        return None
+    s = raw.strip().lower()
+    if s in ("m", "male"):
+        return "male"
+    if s in ("f", "female"):
+        return "female"
+    return "other"
+
+
+def _build_case_uid(pmid, case_index_in_article):
+    """Schema case_uid pattern: ^pmid_[0-9]+_[0-9]+$.
+    Single-patient articles use _1 (case_index_in_article == 1)."""
+    if not pmid or case_index_in_article is None:
+        return None
+    return f"pmid_{pmid}_{case_index_in_article}"
+
+
 if __name__ == "__main__":
-    patient_count = 0
-    patient_in_case_count = 0
+    default_meta = Path("/mnt/hdd/sdc/ssim/meta_data")
+    parser = argparse.ArgumentParser(description="PMC-Patients demographic / language filters")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=default_meta / "patient_note_candidates_10k.json",
+        help="JSON array of patient note candidates (e.g. 10k subset)",
+    )
+    parser.add_argument(
+        "--output-patients",
+        type=Path,
+        default=default_meta / "PMC-Patients_10k_subset.json",
+        help="Filtered output JSON (PMC-Patients schema)",
+    )
+    parser.add_argument(
+        "--output-pmids",
+        type=Path,
+        default=default_meta / "PMIDs_10k_subset.json",
+        help="Unique PMIDs JSON list",
+    )
+    parser.add_argument("--workers", type=int, default=18, help="Parallel workers for per-record filters")
+    parser.add_argument(
+        "--chunksize",
+        type=int,
+        default=32,
+        help="Pool.map chunksize (tune for small batches)",
+    )
+    args = parser.parse_args()
+
+    if os.environ.get("FILTERS_DEBUG"):
+        import ipdb  # noqa: T100
+
+        ipdb.set_trace()
+
+    with args.input.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Ordered parallel pass: pool.map preserves result order vs input (needed for dedupe "first wins")
+    with Pool(processes=args.workers) as pool:
+        filtered = pool.map(
+            _filter_one_record,
+            data,
+            chunksize=max(1, args.chunksize),
+        )
 
     low_length_count = 0
     not_en_count = 0
     no_demo_count = 0
+    dup_count = 0
     new_data = []
-    patients = set()
-    import ipdb; ipdb.set_trace()
-    data = json.load(open("../../../meta_data/patient_note_candidates.json", "r"))
-    for dat in tqdm(data):
-        # Remove duplicates
-        if dat['patient'] in patients:
-            continue
-        patients.add(dat['patient'])
-        # Length filter
-        if not length_filter(dat['patient']):
+    seen_patients = set()
+    patient_count = 0
+    patient_in_case_count = 0
+
+    for _dat, (status, temp) in tqdm(
+        list(zip(data, filtered)),
+        desc="Dedupe + assign ids",
+        total=len(data),
+    ):
+        if status == "length":
             low_length_count += 1
             continue
-        # Language filter
-        if not en_filter(dat['patient']):
+        if status == "en":
             not_en_count += 1
             continue
-        # Demographic filter
-        if not demo_filter(dat['patient']):
+        if status == "demo":
             no_demo_count += 1
             continue
-        # Extract demographic characteristics
-        age, gender = demo_filter(dat['patient'])
-        temp = dat
-        temp['age'] = age
-        temp['gender'] = gender
-        temp['patient_id'] = str(len(new_data))
+        if temp["patient"] in seen_patients:
+            dup_count += 1
+            continue
+        seen_patients.add(temp["patient"])
+        temp["patient_id"] = str(len(new_data))
         new_data.append(temp)
         patient_count += 1
-        
-        if dat['article_type'].strip() == 'case-report':
+        if str(temp.get("article_type", "")).strip() == "case-report":
             patient_in_case_count += 1
 
     print("Patient count: ", patient_count)
@@ -244,26 +366,61 @@ if __name__ == "__main__":
     print("Length lt 10 count: ", low_length_count)
     print("Not English count: ", not_en_count)
     print("No demographic count: ", no_demo_count)
+    print("Duplicate patient text skipped: ", dup_count)
     print("PMC-Patients count: ", len(new_data))
 
-    patients = []
+    patients_out = []
     PMIDs = []
-    # Generate patient_uid
     for i in range(len(new_data)):
         patient = new_data[i]
-        PMCID = patient['file_path'].split('/')[-1][3:-4]
-        if (i == 0) or (patients[i - 1]['patient_uid'].split("-")[0] != PMCID):
+        PMCID = patient["file_path"].split("/")[-1][3:-4]
+        if (i == 0) or (patients_out[i - 1]["patient_uid"].split("-")[0] != PMCID):
             index = "1"
-        elif (i > 0) and (patients[i - 1]['patient_uid'].split("-")[0] == PMCID):
-            index = str(int(patients[i - 1]['patient_uid'].split('-')[1]) + 1)
-        patient_uid = PMCID + '-' + index
-        temp = {"patient_id": patient["patient_id"], "patient_uid": patient_uid, "PMID": patient['PMID'], "file_path": patient['file_path'],\
-            "title": patient['title'], "patient": patient['patient'], "age": patient["age"], "gender": patient['gender']}
-        PMIDs.append(temp['PMID'])
-        patients.append(temp)
+        else:
+            index = str(int(patients_out[i - 1]["patient_uid"].split("-")[1]) + 1)
+        patient_uid = PMCID + "-" + index
+        # Schema-conformant fields (case_schema_v0.1.json) added alongside
+        # legacy fields so existing downstream code keeps working while
+        # downstream renderers can switch to the canonical shape.
+        case_uid = _build_case_uid(patient.get("PMID"), patient.get("case_index_in_article"))
+        license_norm = _normalize_license(patient.get("license"))
+        age_years = _age_to_years(patient["age"])
+        sex = _normalize_sex(patient["gender"])
+        # Start with everything the upstream extractor produced (this carries
+        # forward unknown fields like `tables[]` added 2026-05-13 — without
+        # this, A1 silently drops any field not in the legacy allowlist below).
+        # Then layer the normalised / schema-aligned overrides on top.
+        temp = dict(patient)
+        temp.update({
+            "case_uid": case_uid,
+            "patient_id": patient["patient_id"],
+            "patient_uid": patient_uid,
+            "PMID": patient["PMID"],
+            "pmcid": patient.get("pmcid"),
+            "file_path": patient["file_path"],
+            "journal": patient.get("journal"),
+            "license": license_norm,                # normalized to schema enum
+            "license_raw": patient.get("license"),  # preserved original for audit
+            "publication_date": patient.get("publication_date"),
+            "article_type": patient.get("article_type"),
+            "cases_in_article": patient.get("cases_in_article"),
+            "case_index_in_article": patient.get("case_index_in_article"),
+            "title": patient["title"],
+            "patient": patient["patient"],
+            "age": patient["age"],          # legacy: list-of-tuples
+            "age_years": age_years,         # schema-conformant numeric
+            "gender": patient["gender"],    # legacy: 'M'/'F'
+            "sex": sex,                     # schema-conformant enum
+        })
+        PMIDs.append(temp["PMID"])
+        patients_out.append(temp)
 
-    json.dump(patients, open("../../../meta_data/PMC-Patients.json", "w"), indent = 4)
-    json.dump(list(set(PMIDs)), open("../../../meta_data/PMIDs.json", "w"), indent = 4)
-    
-    #import ipdb; ipdb.set_trace()
+    args.output_patients.parent.mkdir(parents=True, exist_ok=True)
+    with args.output_patients.open("w", encoding="utf-8") as f:
+        json.dump(patients_out, f, indent=4)
+    with args.output_pmids.open("w", encoding="utf-8") as f:
+        json.dump(list(set(PMIDs)), f, indent=4)
+
+    print("Wrote", args.output_patients)
+    print("Wrote", args.output_pmids)
 
