@@ -8,7 +8,7 @@ import os
 p_nodes = ['p', 'list-item', 'disp-quote', "AbstractText"]
 sec_nodes = ['sec', 'list']
 inline_elements = ['italic', 'bold', 'sup', 'strike', 'sub', 'sc', 'named-content', 'underline', \
-    'statement', 'monospace', 'roman', 'overline', 'styled-content']
+    'statement', 'monospace', 'roman', 'overline', 'styled-content', 'xref']
 
 # Detect label in titles, such as "3.1" in "3.1 Patient 1"
 label_pattern = re.compile(r'^[0-9]\.?[0-9]?\.?[0-9]?\.? ?')
@@ -26,7 +26,75 @@ def clean_text(text):
     text = re.sub(space, ' ', text).replace(u'\u2010', '-').strip()
     text = re.sub(r" +", ' ', text)
     text = re.sub(r"\n+", "\n", text)
+    text = clean_text_artifacts(text)
     return text
+
+
+# Regex set for post-extraction cleanup of xref-stripping artifacts.
+# Square/round brackets containing nothing but whitespace and citation-style
+# punctuation (commas, semicolons, dashes) \u2014 left over when self-closing
+# bibr xrefs were collapsed to nothing. Only matches *fully empty* brackets;
+# brackets with any digit/letter content are preserved.
+_empty_brackets_pattern = re.compile(r'[\[\(]\s*[,;\-\s]*\s*[\]\)]')
+# Trailing punctuation cluster left behind: "  , ," after empty xrefs.
+_orphan_punct_pattern = re.compile(r' ([,;:.!?])')
+# Collapse multiple consecutive spaces.
+_multispace_pattern = re.compile(r' {2,}')
+
+
+def clean_text_artifacts(text):
+    """Post-extraction cleanup of artifacts left by xref stripping.
+    Removes empty citation brackets like "[, , ]", "[-]", "()".
+    Idempotent \u2014 safe to call multiple times.
+    """
+    text = _empty_brackets_pattern.sub('', text)
+    text = _orphan_punct_pattern.sub(r'\1', text)
+    text = _multispace_pattern.sub(' ', text)
+    return text
+
+
+def clean_refs(root):
+    """Resolve xref elements in place \u2014 call once before parse_paragraph.
+
+    Strategy:
+      - bibr/ref xrefs: leave alone. If they have inner text (e.g. "1"),
+        getText preserves it via the inline_elements pickup, giving "[1]".
+        If self-closing, they contribute nothing \u2014 surrounding empty
+        brackets get post-cleaned by clean_text_artifacts.
+      - fig/table xrefs with EMPTY .text: inject the resolved label from
+        the document's <fig>/<table-wrap> id-to-label map. Falls back to
+        "[<rid>]" if the rid doesn't resolve.
+      - fig/table xrefs with existing .text: leave alone (author chose
+        their phrasing \u2014 don't overwrite "Fig. 1" with "Figure 1").
+
+    Why: PMC XML often uses self-closing <xref/> elements that rely on the
+    publisher's XSLT to render labels. Plain ElementTree parsing gives us
+    empty strings. This pass restores the visible content authors intended,
+    keeping image-text binding signals (e.g. "Figure 3") intact for Step 2
+    image-case-lesion linking.
+    """
+    id_to_label = {}
+    for elem in root.iter():
+        if elem.tag in ('fig', 'table-wrap') and elem.get('id'):
+            label_el = elem.find('label')
+            if label_el is not None:
+                label_text = ''.join(label_el.itertext()).strip()
+                if label_text:
+                    id_to_label[elem.get('id')] = label_text
+
+    for xref in root.iter('xref'):
+        ref_type = xref.get('ref-type', '')
+        if ref_type not in ('fig', 'table'):
+            continue
+        if (xref.text or '').strip():
+            continue
+        rid = xref.get('rid', '')
+        if rid in id_to_label:
+            xref.text = id_to_label[rid]
+        elif rid:
+            xref.text = f'[{rid}]'
+
+    return root
 
 """
     Extract title in a title node.
@@ -98,6 +166,58 @@ def getSection(sec):
     for para in paras:
         text += para[1] + '\n'
     return clean_text(text)
+
+
+def extract_article_tables(root):
+    """Walk <table-wrap> elements anywhere in the article, return list of structured dicts.
+
+    Each entry: {table_id, label, caption, structured_rows}.
+    structured_rows is a best-effort list[list[str]] of cell text. Handles
+    both HTML-style tables (<table><tr><td>) and OASIS-CALS tables
+    (<tgroup><row><entry>) — PMC articles use either convention.
+
+    Walks from the article root (not just <body>) because PMC articles
+    commonly place tables inside <floats-group>, a sibling of <body>
+    used by publishers to hold floating elements (tables, figures, boxed text)
+    referenced via <xref> rather than inlined.
+
+    Call AFTER clean_refs(root) so xref labels inside captions are resolved.
+    """
+    if root is None:
+        return []
+    tables = []
+    for tw in root.iter('table-wrap'):
+        table_id = tw.get('id', '')
+        label_el = tw.find('label')
+        label = getText(label_el) if label_el is not None else ''
+        caption_el = tw.find('caption')
+        caption = getText(caption_el) if caption_el is not None else ''
+
+        rows = []
+        for table_el in tw.iter('table'):
+            for tr in table_el.iter('tr'):
+                row_cells = [getText(c) for c in tr if c.tag in ('td', 'th')]
+                if row_cells:
+                    rows.append(row_cells)
+        if not rows:
+            for row in tw.iter('row'):
+                row_cells = [getText(c) for c in row.findall('entry')]
+                if row_cells:
+                    rows.append(row_cells)
+
+        # label_number — int N parsed from "Table N" — downstream bind.py uses
+        # this to match [TABLE:N] markers against tables.
+        m = re.search(r'(\d+)', label)
+        label_number = int(m.group(1)) if m else None
+
+        tables.append({
+            'table_id': table_id,
+            'label': label,
+            'label_number': label_number,
+            'caption': caption,
+            'structured_rows': rows,
+        })
+    return tables
 
 
 '''
