@@ -86,7 +86,11 @@ def clean_refs(root):
         ref_type = xref.get('ref-type', '')
         if ref_type not in ('fig', 'table'):
             continue
-        if (xref.text or '').strip():
+        # Check ALL descendant text, not just direct .text: PMC often wraps the
+        # visible reference in a child (e.g. <xref><bold>Figure 1A</bold></xref>),
+        # leaving .text empty. Overwriting it would destroy the panel letter
+        # ("1A" -> "1"). Only inject a label when the xref is genuinely empty.
+        if ''.join(xref.itertext()).strip():
             continue
         rid = xref.get('rid', '')
         if rid in id_to_label:
@@ -120,7 +124,11 @@ def getTitle(sec):
 def getText(para):
     text = para.text if para.text else ""
     for child in para:
-        if child.tag in inline_elements:
+        if child.tag == 'xref':
+            # xref content may live in children (e.g. <xref><bold>Figure 1A</bold>
+            # </xref>); itertext() captures the panel letter that plain .text drops.
+            text += ''.join(child.itertext())
+        elif child.tag in inline_elements:
             text += child.text if child.text else ""
         if child.tag in sec_nodes or child.tag in p_nodes:
             text += getText(child) + ' '
@@ -220,8 +228,82 @@ def extract_article_tables(root):
     return tables
 
 
+def extract_article_figures(root):
+    """Walk <fig> elements anywhere in the article, return list of structured dicts.
+
+    Each entry: {fig_id, label, label_number, caption, panels}.
+      - fig_id: XML id attribute
+      - label: e.g., "Figure 1", "Fig. 2"
+      - label_number: int N parsed from label (downstream binding + the
+        rephrase.py caption-aware criterion 5 use this to match
+        [IMAGE_FINDING:N] markers against figures)
+      - caption: full caption text — used by rephrase.py as GROUND TRUTH
+        for what is image-recoverable (caption-aware masking rule, 2026-05-21)
+      - panels: list of {panel_id, label, caption} for any nested <fig> sub-panels
+        (PMC encodes multi-panel figures either as nested <fig> children of a
+        <fig-group> or as panel-letter prefixes embedded in the caption text).
+        Empty list for flat single-panel figures.
+
+    Mirrors extract_article_tables(): walks from article root (not just <body>)
+    because PMC commonly places figures in <floats-group> as a sibling of <body>,
+    referenced via <xref> rather than inlined.
+
+    Call AFTER clean_refs(root) so xref labels inside captions are resolved.
+    """
+    if root is None:
+        return []
+
+    def _full_text(el):
+        """Concatenate all text descendants. Use itertext() because PMC commonly
+        wraps caption content in <title>/<p>/inline tags, and the existing
+        getText() helper does not recurse into <title>."""
+        if el is None:
+            return ''
+        out = ' '.join(t.strip() for t in el.itertext() if t and t.strip())
+        return clean_text(out)
+
+    figs = []
+    for fg in root.iter('fig'):
+        fig_id = fg.get('id', '')
+        label_el = fg.find('label')
+        label = _full_text(label_el)
+        caption_el = fg.find('caption')
+        caption = _full_text(caption_el)
+
+        # label_number — int N parsed from "Figure N" — downstream uses this
+        # to match [IMAGE_FINDING:N] markers against figures.
+        m = re.search(r'(\d+)', label)
+        label_number = int(m.group(1)) if m else None
+
+        # Sub-panels: PMC encodes panel labels (A, B, C) either as nested
+        # <fig> children of a <fig-group> OR via panel letters embedded in
+        # the caption ("Fig. 1A: ...; Fig. 1B: ..."). We capture the structural
+        # path here; downstream code can also parse caption text for embedded
+        # panel labels.
+        panels = []
+        for sub in fg.findall('fig'):
+            sub_label_el = sub.find('label')
+            sub_label = _full_text(sub_label_el)
+            sub_cap_el = sub.find('caption')
+            sub_caption = _full_text(sub_cap_el)
+            panels.append({
+                'panel_id': sub.get('id', ''),
+                'label': sub_label,
+                'caption': sub_caption,
+            })
+
+        figs.append({
+            'fig_id': fig_id,
+            'label': label,
+            'label_number': label_number,
+            'caption': caption,
+            'panels': panels,
+        })
+    return figs
+
+
 '''
-if __name__ == "__main__":    
+if __name__ == "__main__":
     cases = json.load(open("../../meta_data/PMC-Patients.txt", "r"))
     directory = "../../../PMC_OA"
 

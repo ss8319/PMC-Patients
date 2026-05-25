@@ -9,7 +9,7 @@ import re
 from tqdm import trange, tqdm
 import sys
 sys.path.append("..")
-from xml_utils import parse_paragraph, getTitle, getText, getSection, clean_text, clean_refs, extract_article_tables
+from xml_utils import parse_paragraph, getTitle, getText, getSection, clean_text, clean_refs, extract_article_tables, extract_article_figures
 
 
 # CC variants accepted at Stage A. ND-tagged variants (CC BY-ND, CC BY-NC-ND) are excluded
@@ -132,7 +132,8 @@ def extract(msg):
     patient_count = 0
     error_count = 0
     patients = []
-    article_tables = []  # populated once body is available; closure-captured by finalize().
+    article_tables = []   # populated once body is available; closure-captured by finalize().
+    article_figures = []  # ditto — figure captions for the caption-aware rephrase rule (2026-05-21).
 
     def finalize():
         # Attach per-article case multiplicity to each patient row. Empty-patients
@@ -143,11 +144,15 @@ def extract(msg):
         # tables: article-level <table-wrap> content. Single-patient articles get
         # them all; multi-patient cases get the union (downstream v0.1 drops
         # multi-patient anyway — see CLAUDE.md §6.1).
+        # figures: article-level <fig> caption content. Used by rephrase.py
+        # caption-aware criterion 5 as ground truth for what is image-recoverable
+        # (replaces the morphology-vs-non-morphology taxonomy heuristic, 2026-05-21).
         n = len(patients)
         for i, p in enumerate(patients):
             p["cases_in_article"] = n
             p["case_index_in_article"] = i + 1
             p["tables"] = article_tables
+            p["figures"] = article_figures
         return article_count, case_report_type_count, patient_count, error_count, patients
 
     # Stage A license filter: exclude ND variants (see ALLOWED_LICENSES at module top).
@@ -191,6 +196,10 @@ def extract(msg):
     # finalize() attaches the result to every patient (single-patient is the v0.1
     # scope per CLAUDE.md §6.1).
     article_tables = extract_article_tables(root)
+    # Same pattern for figures — captions feed rephrase.py's caption-aware
+    # criterion 5 (2026-05-21). Both walks must happen AFTER clean_refs(root)
+    # so that <xref> labels inside captions are resolved.
+    article_figures = extract_article_figures(root)
 
     pmcid = _parse_pmcid(root)
     publication_date = _parse_pub_date(root)
