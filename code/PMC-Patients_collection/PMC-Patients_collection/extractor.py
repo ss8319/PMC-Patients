@@ -10,6 +10,8 @@ from tqdm import trange, tqdm
 import sys
 sys.path.append("..")
 from xml_utils import parse_paragraph, getTitle, getText, getSection, clean_text, clean_refs, extract_article_tables, extract_article_figures
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from provenance import stamp  # vendored append-only per-row trace (Stage 0 survivor stamp)
 
 
 # CC variants accepted at Stage A. ND-tagged variants (CC BY-ND, CC BY-NC-ND) are excluded
@@ -216,6 +218,7 @@ def extract(msg):
                 patient = getSection(sec)
                 if len(patient) > 0:
                     patients.append({"title": article_title, "journal": journal_name, "file_path": file_path, "PMID": PMID, "pmcid": pmcid, "publication_date": publication_date, "license": License, "patient": patient, "article_type": article_type})
+                    stamp(patients[-1], "extractor_stage0", "kept", journal=journal_name, license=License)
                     patient_count += 1
                     f = True
 
@@ -249,6 +252,7 @@ def extract(msg):
             patient = patient.strip()
             if len(patient) > 0:
                 patients.append({"title": article_title, "journal": journal_name, "file_path": file_path, "PMID": PMID, "pmcid": pmcid, "publication_date": publication_date, "license": License, "patient": patient, "article_type": article_type})
+                stamp(patients[-1], "extractor_stage0", "kept", journal=journal_name, license=License)
                 patient_count += 1
                 f = True
     
@@ -281,6 +285,7 @@ def extract(msg):
             patient = patient.strip()
             if len(patient) > 0:
                 patients.append({"title": article_title, "journal": journal_name, "file_path": file_path, "PMID": PMID, "pmcid": pmcid, "publication_date": publication_date, "license": License, "patient": patient, "article_type": article_type})
+                stamp(patients[-1], "extractor_stage0", "kept", journal=journal_name, license=License)
                 patient_count += 1
                 f = True
 
@@ -298,6 +303,7 @@ def extract(msg):
                 patient = getSection(sec)
                 if len(patient) > 0:
                     patients.append({"title": article_title, "journal": journal_name, "file_path": file_path, "PMID": PMID, "pmcid": pmcid, "publication_date": publication_date, "license": License, "patient": patient, "article_type": article_type})
+                    stamp(patients[-1], "extractor_stage0", "kept", journal=journal_name, license=License)
                     patient_count += 1
                     f = True
                     break

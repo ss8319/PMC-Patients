@@ -8,6 +8,10 @@ from pathlib import Path
 from tqdm import trange, tqdm
 from word2number import w2n
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from provenance import stamp, reject, rejects_path_for  # vendored append-only per-row trace
+
 # Usual age pattern such as "3 years old", "1-year- and 2-month-old"
 age_pattern = r"(((?P<year>[0-9]+\.?[0-9]?([ /\._\-\‐]and[ /\._\-\‐](((a)|(one))[ /\._\-\‐])?half)?)[ /\._\-\‐]*((y((ear)|r)?)s?)([ /\._\-\‐]*and[ /\._\-\‐])?)|((?P<month>[0-9]+\.?[0-9]?([ /\._\-\‐]and[ /\._\-\‐](((a)|(one))[ /\._\-\‐])?half)?)[ /\._\-\‐]*((m(onth)?)s?)([ /\._\-\‐]*and[ /\._\-\‐])?)|((?P<week>[0-9]+\.?[0-9]?([ /\._\-\‐]and[ /\._\-\‐](((a)|(one))[ /\._\-\‐])?half)?)[ /\._\-\‐]*((w(eek)?)s?)([ /\._\-\‐]*and[ /\._\-\‐])?)|((?P<day>[0-9]+\.?[0-9]?([ /\._\-\‐]and[ /\._\-\‐](((a)|(one))[ /\._\-\‐])?half)?)[ /\._\-\‐]*((d(ay)?)s?)([ /\._\-\‐]*and[ /\._\-\‐])?)|((?P<hour>[0-9]+\.?[0-9]?([ /\._\-\‐]and[ /\._\-\‐](((a)|(one))[ /\._\-\‐])?half)?)[ /\._\-\‐]*((h(our)?)s?)))+"
 age_pattern1 = re.compile(age_pattern + "[ /\._\-\‐](o(ld)?)[^a-z]")
@@ -337,22 +341,26 @@ if __name__ == "__main__":
     patient_count = 0
     patient_in_case_count = 0
 
+    # A1 reject sidecar (provenance option a). Clear stale entries each run.
+    _rejects = rejects_path_for(args.output_patients)
+    _rejects.unlink(missing_ok=True)
+    _drop_reason = {"length": "length_lt_10", "en": "not_english_or_high_nonascii",
+                    "demo": "no_parseable_age_or_gender"}
+
     for _dat, (status, temp) in tqdm(
         list(zip(data, filtered)),
         desc="Dedupe + assign ids",
         total=len(data),
     ):
-        if status == "length":
-            low_length_count += 1
-            continue
-        if status == "en":
-            not_en_count += 1
-            continue
-        if status == "demo":
-            no_demo_count += 1
+        if status in ("length", "en", "demo"):
+            if status == "length": low_length_count += 1
+            elif status == "en": not_en_count += 1
+            else: no_demo_count += 1
+            reject(_dat, "A1_filters", _drop_reason[status], _rejects)
             continue
         if temp["patient"] in seen_patients:
             dup_count += 1
+            reject(_dat, "A1_filters", "duplicate_patient_text", _rejects)
             continue
         seen_patients.add(temp["patient"])
         temp["patient_id"] = str(len(new_data))
@@ -412,6 +420,8 @@ if __name__ == "__main__":
             "gender": patient["gender"],    # legacy: 'M'/'F'
             "sex": sex,                     # schema-conformant enum
         })
+        stamp(temp, "A1_filters", "kept",
+              age_years=age_years, sex=sex, license=license_norm)
         PMIDs.append(temp["PMID"])
         patients_out.append(temp)
 
