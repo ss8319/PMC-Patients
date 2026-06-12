@@ -10,6 +10,8 @@ from tqdm import trange, tqdm
 import sys
 sys.path.append("..")
 from xml_utils import parse_paragraph, getTitle, getText, getSection, clean_text, clean_refs, extract_article_tables, extract_article_figures
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from provenance import stamp  # vendored append-only per-row trace (Stage 0 survivor stamp)
 
 
 # CC variants accepted at Stage A. ND-tagged variants (CC BY-ND, CC BY-NC-ND) are excluded
@@ -135,7 +137,7 @@ def extract(msg):
     article_tables = []   # populated once body is available; closure-captured by finalize().
     article_figures = []  # ditto — figure captions for the caption-aware rephrase rule (2026-05-21).
 
-    def finalize():
+    def finalize(reject_reason=None):
         # Attach per-article case multiplicity to each patient row. Empty-patients
         # returns are no-ops. cases_in_article > 1 signals that the article's
         # Discussion section (and any cross-patient prose) is shared across
@@ -153,11 +155,18 @@ def extract(msg):
             p["case_index_in_article"] = i + 1
             p["tables"] = article_tables
             p["figures"] = article_figures
-        return article_count, case_report_type_count, patient_count, error_count, patients
+        # Article-level reject record (provenance): Stage 0 drops WHOLE articles
+        # (license / parse-error / no-body-title / journal) before any patient row
+        # exists, so the reason can't ride a per-row trace — the main loop writes it
+        # to a separate article-rejects sidecar. None on the survivor/empty paths.
+        article_reject = ({"PMID": PMID, "file_path": file_path,
+                           "stage": "extractor_stage0", "reason": reject_reason}
+                          if reject_reason is not None else None)
+        return article_count, case_report_type_count, patient_count, error_count, patients, article_reject
 
     # Stage A license filter: exclude ND variants (see ALLOWED_LICENSES at module top).
     if License not in ALLOWED_LICENSES:
-        return finalize()
+        return finalize("license_excluded")
     f = False
     article_count += 1
 
@@ -167,7 +176,7 @@ def extract(msg):
         clean_refs(root)
     except Exception as e:
         error_count += 1
-        return finalize()
+        return finalize("xml_parse_error")
 
     article_type = root.attrib['article-type']
     if article_type == 'case-report':
@@ -178,7 +187,7 @@ def extract(msg):
     # Remove articles without body or title.
     if (body is None) or (article_title is None):
         error_count += 1
-        return finalize()
+        return finalize("no_body_or_title")
 
     article_title = getText(article_title)
 
@@ -189,7 +198,7 @@ def extract(msg):
     # Journal allowlist: skip case detection unless journal matches derm-substring rule
     # OR adjacent-journal allowlist. Cheap reject before the expensive XML walks below.
     if not _journal_is_allowlisted(journal_name):
-        return finalize()
+        return finalize("journal_not_allowlisted")
 
     # Walk <table-wrap> elements once at article level (root, not just body —
     # publishers sometimes place tables in <floats-group> as a sibling of body).
@@ -216,6 +225,7 @@ def extract(msg):
                 patient = getSection(sec)
                 if len(patient) > 0:
                     patients.append({"title": article_title, "journal": journal_name, "file_path": file_path, "PMID": PMID, "pmcid": pmcid, "publication_date": publication_date, "license": License, "patient": patient, "article_type": article_type})
+                    stamp(patients[-1], "extractor_stage0", "kept", journal=journal_name, license=License)
                     patient_count += 1
                     f = True
 
@@ -249,6 +259,7 @@ def extract(msg):
             patient = patient.strip()
             if len(patient) > 0:
                 patients.append({"title": article_title, "journal": journal_name, "file_path": file_path, "PMID": PMID, "pmcid": pmcid, "publication_date": publication_date, "license": License, "patient": patient, "article_type": article_type})
+                stamp(patients[-1], "extractor_stage0", "kept", journal=journal_name, license=License)
                 patient_count += 1
                 f = True
     
@@ -281,6 +292,7 @@ def extract(msg):
             patient = patient.strip()
             if len(patient) > 0:
                 patients.append({"title": article_title, "journal": journal_name, "file_path": file_path, "PMID": PMID, "pmcid": pmcid, "publication_date": publication_date, "license": License, "patient": patient, "article_type": article_type})
+                stamp(patients[-1], "extractor_stage0", "kept", journal=journal_name, license=License)
                 patient_count += 1
                 f = True
 
@@ -298,6 +310,7 @@ def extract(msg):
                 patient = getSection(sec)
                 if len(patient) > 0:
                     patients.append({"title": article_title, "journal": journal_name, "file_path": file_path, "PMID": PMID, "pmcid": pmcid, "publication_date": publication_date, "license": License, "patient": patient, "article_type": article_type})
+                    stamp(patients[-1], "extractor_stage0", "kept", journal=journal_name, license=License)
                     patient_count += 1
                     f = True
                     break
@@ -401,6 +414,10 @@ if __name__ == "__main__":
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
     output_file = open(output_jsonl, mode, buffering=1)  # Line buffered
+    # Stage 0 article-level rejects (provenance): whole articles dropped by the
+    # license / journal / parse / no-body gates, which have no patient row to carry
+    # a trace. Same resume `mode` as the main output.
+    article_rejects_file = open(output_jsonl.with_suffix(".article_rejects.jsonl"), mode, buffering=1)
     
     pool = Pool(processes=args.workers)
     processed = 0
@@ -420,7 +437,11 @@ if __name__ == "__main__":
         # Write each patient note immediately (JSONL format)
         for patient in result[4]:
             output_file.write(json.dumps(patient) + "\n")
-        
+
+        # Stage 0 article-level reject (license / journal / parse / no-body)
+        if result[5] is not None:
+            article_rejects_file.write(json.dumps(result[5]) + "\n")
+
         processed += 1
         
         # Checkpoint every N articles (AFTER write completes)
@@ -435,6 +456,7 @@ if __name__ == "__main__":
     pool.close()
     pool.join()
     output_file.close()
+    article_rejects_file.close()
     
     # Final checkpoint
     with open(checkpoint_file, "w") as f:
