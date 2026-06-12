@@ -31,11 +31,14 @@ def clean_text(text):
 
 
 # Regex set for post-extraction cleanup of xref-stripping artifacts.
-# Square/round brackets containing nothing but whitespace and citation-style
-# punctuation (commas, semicolons, dashes) \u2014 left over when self-closing
-# bibr xrefs were collapsed to nothing. Only matches *fully empty* brackets;
-# brackets with any digit/letter content are preserved.
-_empty_brackets_pattern = re.compile(r'[\[\(]\s*[,;\-\s]*\s*[\]\)]')
+# Square/round brackets left over when self-closing bibr xrefs were collapsed
+# to nothing \u2014 e.g. "[, , ]" or "[ ; ]". We require AT LEAST ONE comma or
+# semicolon inside, so the bracket is unambiguously a citation-separator husk.
+# This deliberately does NOT match a bracket whose only content is a dash or
+# whitespace: "(-)" / "[-]" / "( )" are meaningful in clinical text (a negative
+# IHC / lab result), and stripping them silently corrupts the corpus. Brackets
+# with any digit/letter content are also preserved.
+_empty_brackets_pattern = re.compile(r'[\[\(]\s*[,;][,;\-\s]*[\]\)]')
 # Trailing punctuation cluster left behind: "  , ," after empty xrefs.
 _orphan_punct_pattern = re.compile(r' ([,;:.!?])')
 # Collapse multiple consecutive spaces.
@@ -44,7 +47,9 @@ _multispace_pattern = re.compile(r' {2,}')
 
 def clean_text_artifacts(text):
     """Post-extraction cleanup of artifacts left by xref stripping.
-    Removes empty citation brackets like "[, , ]", "[-]", "()".
+    Removes citation-separator husks like "[, , ]" / "[ ; ]" (brackets whose
+    only content is whitespace plus at least one comma/semicolon). Leaves
+    "(-)", "[-]", "( )" intact \u2014 those carry clinical meaning (negative result).
     Idempotent \u2014 safe to call multiple times.
     """
     text = _empty_brackets_pattern.sub('', text)
@@ -176,6 +181,17 @@ def getSection(sec):
     return clean_text(text)
 
 
+def _full_text(el):
+    """Concatenate all text descendants via itertext(). PMC commonly wraps
+    caption/label content in <title>, which getText() does not recurse into —
+    so getText() returns '' for title-only captions. Shared by the table and
+    figure extractors. Returns '' for a missing element."""
+    if el is None:
+        return ''
+    out = ' '.join(t.strip() for t in el.itertext() if t and t.strip())
+    return clean_text(out)
+
+
 def extract_article_tables(root):
     """Walk <table-wrap> elements anywhere in the article, return list of structured dicts.
 
@@ -197,9 +213,9 @@ def extract_article_tables(root):
     for tw in root.iter('table-wrap'):
         table_id = tw.get('id', '')
         label_el = tw.find('label')
-        label = getText(label_el) if label_el is not None else ''
+        label = _full_text(label_el)
         caption_el = tw.find('caption')
-        caption = getText(caption_el) if caption_el is not None else ''
+        caption = _full_text(caption_el)
 
         rows = []
         for table_el in tw.iter('table'):
@@ -252,15 +268,6 @@ def extract_article_figures(root):
     """
     if root is None:
         return []
-
-    def _full_text(el):
-        """Concatenate all text descendants. Use itertext() because PMC commonly
-        wraps caption content in <title>/<p>/inline tags, and the existing
-        getText() helper does not recurse into <title>."""
-        if el is None:
-            return ''
-        out = ' '.join(t.strip() for t in el.itertext() if t and t.strip())
-        return clean_text(out)
 
     figs = []
     for fg in root.iter('fig'):

@@ -345,7 +345,7 @@ if __name__ == "__main__":
         help="Checkpoint file used to resume extraction",
     )
     parser.add_argument("--workers", type=int, default=18, help="Parallel workers")
-    parser.add_argument("--chunksize", type=int, default=32, help="imap_unordered chunksize")
+    parser.add_argument("--chunksize", type=int, default=32, help="imap chunksize")
     parser.add_argument(
         "--journal-config",
         type=Path,
@@ -423,8 +423,11 @@ if __name__ == "__main__":
     processed = 0
     checkpoint_interval = 10000  # Save checkpoint every 10k articles
     
+    # NOTE: ordered imap (not imap_unordered) — the positional checkpoint below
+    # (start_idx + processed) is only correct if results return in input order.
+    # With unordered completion, a resume could skip articles that never finished.
     for result in tqdm(
-        pool.imap_unordered(extract, msgs, chunksize=args.chunksize),
+        pool.imap(extract, msgs, chunksize=args.chunksize),
         total=n,
         desc="Extracting articles",
     ):
