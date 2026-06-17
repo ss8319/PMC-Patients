@@ -392,6 +392,12 @@ def extract_scraped_article(msg):
         "license": license_canonical,
         "patient": patient_text,
         "article_type": article_type,
+        # Scraped-source provenance + stable identity. PMC rows key patient_uid
+        # off PMID; scraped rows have none, so filters.py builds the uid from
+        # `source` + `doi`/`journal_article_id` instead. Carried through by
+        # filters.py's dict(patient) preservation.
+        "source": source,
+        "doi": doi_or_id,
     })
     stamp(patients[-1], "extractor_stage0_scraped", "kept",
           journal=journal_name, license=license_canonical, source=source)
@@ -599,7 +605,7 @@ def extract(msg):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Extract patient-note candidates from PMC XML")
+    parser = argparse.ArgumentParser(description="Extract patient-note candidates from PMC XML and/or scraped journals")
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -632,117 +638,198 @@ if __name__ == "__main__":
         default=Path("/mnt/hdd/sdc/ssim/DermArena/dataset_collection/journal_config.json"),
         help="Path to journal_config.json (derm_match patterns + adjacent_journals allowlist)",
     )
+    # Source dispatch. "pmc" = the existing PMC OA XML path (unchanged). "scraped"
+    # = the 4 local-scrape journals. Both write to the SAME --output-jsonl so
+    # filters.py consumes them together.
+    parser.add_argument(
+        "--source",
+        nargs="+",
+        choices=["pmc", "scraped"],
+        default=["pmc"],
+        help="Which source(s) to extract from (default: pmc)",
+    )
+    parser.add_argument(
+        "--scraped-root",
+        type=Path,
+        default=Path(__file__).resolve().parents[3] / "scrap" / "output",
+        help="Root containing scrap/output/<journal>/metadata.jsonl (for --source scraped)",
+    )
     args = parser.parse_args()
 
-    # Load journal allowlist into module-level state BEFORE Pool() forks workers (Linux fork inheritance).
-    journal_cfg = json.loads(args.journal_config.read_text())
-    JOURNAL_DERM_PATTERNS = [p.lower() for p in journal_cfg["derm_match"]["patterns"]]
-    JOURNAL_ADJACENT = {_normalize_journal(j) for j in journal_cfg["adjacent_journals"]}
-    print(
-        f"Journal allowlist loaded: {len(JOURNAL_DERM_PATTERNS)} substring patterns + {len(JOURNAL_ADJACENT)} adjacent journals",
-        flush=True,
-    )
+    # Load journal allowlist into module-level state BEFORE Pool() forks workers
+    # (Linux fork inheritance). Graceful fallback to a minimal derm allowlist when
+    # journal_config.json isn't reachable (e.g. running the scraped path on a box
+    # without the DermArena repo) — OK for the 4 scraped journals; for full PMC
+    # sweeps point --journal-config at DermArena/dataset_collection/journal_config.json.
+    if args.journal_config.is_file():
+        journal_cfg = json.loads(args.journal_config.read_text())
+        JOURNAL_DERM_PATTERNS = [p.lower() for p in journal_cfg["derm_match"]["patterns"]]
+        JOURNAL_ADJACENT = {_normalize_journal(j) for j in journal_cfg["adjacent_journals"]}
+        print(
+            f"Journal allowlist loaded from {args.journal_config}: "
+            f"{len(JOURNAL_DERM_PATTERNS)} substring patterns + {len(JOURNAL_ADJACENT)} adjacent journals",
+            flush=True,
+        )
+    else:
+        JOURNAL_DERM_PATTERNS = list(_DEFAULT_DERM_PATTERNS)
+        JOURNAL_ADJACENT = set()
+        print(
+            f"WARN: --journal-config {args.journal_config} not found; using built-in fallback "
+            f"{JOURNAL_DERM_PATTERNS}. Fine for the 4 scraped journals; supply the full config for PMC sweeps.",
+            flush=True,
+        )
 
     # Case-section patterns (title_pattern, label_pattern, case_1_pattern,
-    # first_pattern) are now defined at module level \u2014 see top of file.
+    # first_pattern) are now defined at module level — see top of file.
 
-    data_dir = str(args.data_dir)
-    meta_csv = args.meta_csv
-    if not os.path.isfile(meta_csv):
-        raise FileNotFoundError(
-            f"{meta_csv} not found. Run PMC_OA_meta.py first (writes there), or copy from "
-            f"{os.path.join(data_dir.rstrip('/'), 'PMC_OA_meta.csv')} if you have an older build."
-        )
-    file_list = pd.read_csv(
-        meta_csv,
-        dtype={"file_path": str, "PMID": str, "License": str},
-        low_memory=False,
-    )
-
-    # Output paths
     output_jsonl = args.output_jsonl
-    checkpoint_file = args.checkpoint_file
-    
-    # Resume logic: check if we have a checkpoint
-    start_idx = 0
-    if os.path.isfile(checkpoint_file):
-        with open(checkpoint_file, "r") as f:
-            start_idx = int(f.read().strip())
-        print(f"Resuming from article {start_idx:,} (checkpoint found)", flush=True)
-        file_list = file_list.iloc[start_idx:].reset_index(drop=True)
-    
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+
+    # Shared counters (stat() reads these module globals). The scraped path keeps
+    # its own tallies and prints its own summary.
     article_count = 0
     case_report_type_count = 0
     patient_count = 0
     patient_in_case_count = 0
     error_count = 0
 
-    # Build work queue (vectorized - fast)
-    n = len(file_list)
-    print(f"Building work queue ({n:,} articles)...", flush=True)
-    msgs = list(zip(file_list["file_path"], file_list["PMID"], file_list["License"]))
+    # ───────────────────────────── PMC OA path ─────────────────────────────
+    if "pmc" in args.source:
+        data_dir = str(args.data_dir)
+        meta_csv = args.meta_csv
+        if not os.path.isfile(meta_csv):
+            raise FileNotFoundError(
+                f"{meta_csv} not found. Run PMC_OA_meta.py first (writes there), or copy from "
+                f"{os.path.join(data_dir.rstrip('/'), 'PMC_OA_meta.csv')} if you have an older build."
+            )
+        file_list = pd.read_csv(
+            meta_csv,
+            dtype={"file_path": str, "PMID": str, "License": str},
+            low_memory=False,
+        )
 
-    # Open output file in append mode (safe for resume)
-    mode = "a" if start_idx > 0 else "w"
-    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file = open(output_jsonl, mode, buffering=1)  # Line buffered
-    # Stage 0 article-level rejects (provenance): whole articles dropped by the
-    # license / journal / parse / no-body gates, which have no patient row to carry
-    # a trace. Same resume `mode` as the main output.
-    article_rejects_file = open(output_jsonl.with_suffix(".article_rejects.jsonl"), mode, buffering=1)
-    
-    pool = Pool(processes=args.workers)
-    processed = 0
-    checkpoint_interval = 10000  # Save checkpoint every 10k articles
-    
-    # NOTE: ordered imap (not imap_unordered) — the positional checkpoint below
-    # (start_idx + processed) is only correct if results return in input order.
-    # With unordered completion, a resume could skip articles that never finished.
-    for result in tqdm(
-        pool.imap(extract, msgs, chunksize=args.chunksize),
-        total=n,
-        desc="Extracting articles",
-    ):
-        article_count += result[0]
-        case_report_type_count += result[1]
-        patient_count += result[2]
-        patient_in_case_count += result[1] * result[2]
-        error_count += result[3]
-        
-        # Write each patient note immediately (JSONL format)
-        for patient in result[4]:
-            output_file.write(json.dumps(patient) + "\n")
+        checkpoint_file = args.checkpoint_file
 
-        # Stage 0 article-level reject (license / journal / parse / no-body)
-        if result[5] is not None:
-            article_rejects_file.write(json.dumps(result[5]) + "\n")
+        # Resume logic: check if we have a checkpoint
+        start_idx = 0
+        if os.path.isfile(checkpoint_file):
+            with open(checkpoint_file, "r") as f:
+                start_idx = int(f.read().strip())
+            print(f"Resuming from article {start_idx:,} (checkpoint found)", flush=True)
+            file_list = file_list.iloc[start_idx:].reset_index(drop=True)
 
-        processed += 1
-        
-        # Checkpoint every N articles (AFTER write completes)
-        if processed % checkpoint_interval == 0:
-            output_file.flush()  # Force write to disk
-            os.fsync(output_file.fileno())  # Ensure OS writes to disk
-            with open(checkpoint_file, "w") as cf:
-                cf.write(str(start_idx + processed))
-                cf.flush()
-                os.fsync(cf.fileno())  # Ensure checkpoint on disk
-    
-    pool.close()
-    pool.join()
-    output_file.close()
-    article_rejects_file.close()
-    
-    # Final checkpoint
-    with open(checkpoint_file, "w") as f:
-        f.write(str(start_idx + processed))
+        # Build work queue (vectorized - fast)
+        n = len(file_list)
+        print(f"Building work queue ({n:,} articles)...", flush=True)
+        msgs = list(zip(file_list["file_path"], file_list["PMID"], file_list["License"]))
 
-    stat()
-    print(f"\nDone! Output saved to: {output_jsonl}")
-    print(f"Total patient notes extracted: {patient_count:,}")
-    
-    # Clean up checkpoint on successful completion
-    if os.path.isfile(checkpoint_file):
-        os.remove(checkpoint_file)
+        # Open output file in append mode (safe for resume)
+        mode = "a" if start_idx > 0 else "w"
+        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file = open(output_jsonl, mode, buffering=1)  # Line buffered
+        # Stage 0 article-level rejects (provenance): whole articles dropped by the
+        # license / journal / parse / no-body gates, which have no patient row to carry
+        # a trace. Same resume `mode` as the main output.
+        article_rejects_file = open(output_jsonl.with_suffix(".article_rejects.jsonl"), mode, buffering=1)
 
+        pool = Pool(processes=args.workers)
+        processed = 0
+        checkpoint_interval = 10000  # Save checkpoint every 10k articles
+
+        # NOTE: ordered imap (not imap_unordered) — the positional checkpoint below
+        # (start_idx + processed) is only correct if results return in input order.
+        # With unordered completion, a resume could skip articles that never finished.
+        for result in tqdm(
+            pool.imap(extract, msgs, chunksize=args.chunksize),
+            total=n,
+            desc="Extracting articles",
+        ):
+            article_count += result[0]
+            case_report_type_count += result[1]
+            patient_count += result[2]
+            patient_in_case_count += result[1] * result[2]
+            error_count += result[3]
+
+            # Write each patient note immediately (JSONL format)
+            for patient in result[4]:
+                output_file.write(json.dumps(patient) + "\n")
+
+            # Stage 0 article-level reject (license / journal / parse / no-body)
+            if result[5] is not None:
+                article_rejects_file.write(json.dumps(result[5]) + "\n")
+
+            processed += 1
+
+            # Checkpoint every N articles (AFTER write completes)
+            if processed % checkpoint_interval == 0:
+                output_file.flush()  # Force write to disk
+                os.fsync(output_file.fileno())  # Ensure OS writes to disk
+                with open(checkpoint_file, "w") as cf:
+                    cf.write(str(start_idx + processed))
+                    cf.flush()
+                    os.fsync(cf.fileno())  # Ensure checkpoint on disk
+
+        pool.close()
+        pool.join()
+        output_file.close()
+        article_rejects_file.close()
+
+        # Final checkpoint
+        with open(checkpoint_file, "w") as f:
+            f.write(str(start_idx + processed))
+
+        stat()
+        print(f"\nDone! Output saved to: {output_jsonl}")
+        print(f"Total patient notes extracted: {patient_count:,}")
+
+        # Clean up checkpoint on successful completion
+        if os.path.isfile(checkpoint_file):
+            os.remove(checkpoint_file)
+
+    # ──────────────────────────── Scraped path ─────────────────────────────
+    if "scraped" in args.source:
+        # Our 4 dermatology journals. Each has scrap/output/<journal>/metadata.jsonl
+        # with one row per downloaded article + saved PDF/HTML referenced by path.
+        SCRAPED_JOURNALS = ["acta_apa", "turkjderm", "odermatol", "rad_argentina"]
+        scraped_root = args.scraped_root
+
+        # Append if the PMC path already wrote this run; otherwise start fresh.
+        scraped_mode = "a" if "pmc" in args.source else "w"
+        out_f = open(output_jsonl, scraped_mode, buffering=1)
+        rej_f = open(output_jsonl.with_suffix(".article_rejects.jsonl"), scraped_mode, buffering=1)
+
+        s_articles = s_patients = s_rejects = 0
+        reason_counts = {}
+        for journal in SCRAPED_JOURNALS:
+            meta_path = scraped_root / journal / "metadata.jsonl"
+            if not meta_path.is_file():
+                print(f"  [skip] {journal}: {meta_path} not found", flush=True)
+                continue
+            records = [json.loads(l) for l in open(meta_path, encoding="utf-8") if l.strip()]
+            print(f"  {journal}: {len(records)} articles", flush=True)
+            for record in tqdm(records, desc=f"scraped:{journal}", unit="art"):
+                ac, crt, pc, ec, patients, article_reject = extract_scraped_article((record, str(scraped_root)))
+                article_count += ac
+                case_report_type_count += crt
+                patient_count += pc
+                error_count += ec
+                for p in patients:
+                    out_f.write(json.dumps(p) + "\n")
+                    s_patients += 1
+                if patients:
+                    s_articles += 1
+                if article_reject is not None:
+                    rej_f.write(json.dumps(article_reject) + "\n")
+                    s_rejects += 1
+                    r = article_reject["reason"]
+                    reason_counts[r] = reason_counts.get(r, 0) + 1
+
+        out_f.close()
+        rej_f.close()
+        print(f"\n=== Scraped extraction complete ===")
+        print(f"  Articles with >=1 patient : {s_articles:,}")
+        print(f"  Patient candidates written: {s_patients:,}")
+        print(f"  Article-level rejects     : {s_rejects:,}")
+        for r, c in sorted(reason_counts.items(), key=lambda kv: -kv[1]):
+            print(f"      {c:>6}  {r}")
+        print(f"  Output: {output_jsonl}")
