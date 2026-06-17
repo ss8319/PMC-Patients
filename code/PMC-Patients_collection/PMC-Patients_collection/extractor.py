@@ -20,7 +20,7 @@ from provenance import stamp  # vendored append-only per-row trace (Stage 0 surv
 ALLOWED_LICENSES = {"CC BY", "CC BY-SA", "CC BY-NC", "CC BY-NC-SA", "CC0"}
 
 # Journal allowlist — populated from journal_config.json in __main__ before Pool() forks workers.
-# Workers inherit module-level state via fork() on Linux. See DermArena/dataset_collection/journal_config.json.
+# Workers inherit module-level state via fork() on Linux. See RareArena/dataset_collection/journal_config.json.
 JOURNAL_DERM_PATTERNS: list = []
 JOURNAL_ADJACENT: set = set()
 
@@ -635,7 +635,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--journal-config",
         type=Path,
-        default=Path("/mnt/hdd/sdc/ssim/DermArena/dataset_collection/journal_config.json"),
+        # Default resolves relative to this file: RareArena is a sibling of
+        # PMC-Patients under the Data_collection workspace (parents[4]). Keeps the
+        # full derm-substring + adjacent-journal allowlist in play without a
+        # machine-specific absolute path; override if the config lives elsewhere.
+        # Same parents[N]/__file__ style as --scraped-root below.
+        default=Path(__file__).resolve().parents[4] / "RareArena" / "dataset_collection" / "journal_config.json",
         help="Path to journal_config.json (derm_match patterns + adjacent_journals allowlist)",
     )
     # Source dispatch. "pmc" = the existing PMC OA XML path (unchanged). "scraped"
