@@ -381,16 +381,31 @@ if __name__ == "__main__":
     PMIDs = []
     for i in range(len(new_data)):
         patient = new_data[i]
-        PMCID = patient["file_path"].split("/")[-1][3:-4]
-        if (i == 0) or (patients_out[i - 1]["patient_uid"].split("-")[0] != PMCID):
-            index = "1"
+        # patient_uid scheme depends on the source. PMC rows have a PMID and a
+        # PMC<digits>.xml file_path, so the uid is the PMID-derived "<pmcid>-<idx>".
+        # Scraped rows (the 4 dermatology journals) have no PMID — keying off the
+        # PMC filename slice would yield garbage — so they get their own scheme,
+        # "<source>_<doi>-<idx>", from the source + doi fields the scraped
+        # extractor stamps on each row. See extractor.extract_scraped_article.
+        if patient.get("source") and not patient.get("PMID"):
+            # Sanitize the doi/slug into a path- and split-safe token: collapse
+            # any "/" or "\" path separators and whitespace to "_". Hyphens are
+            # left intact for English-source DOIs (which have none); RAD's
+            # hyphenated slugs never reach here (language_excluded upstream).
+            raw_base = patient.get("doi") or patient.get("source")
+            base = re.sub(r"[\\/\s]+", "_", raw_base).strip("_")
+            case_index = patient.get("case_index_in_article", 1)
+            patient_uid = f"{patient['source']}_{base}-{case_index}"
+            case_uid = f"{patient['source']}_{base}_{case_index}"
         else:
-            index = str(int(patients_out[i - 1]["patient_uid"].split("-")[1]) + 1)
-        patient_uid = PMCID + "-" + index
-        # Schema-conformant fields (case_schema_v0.1.json) added alongside
-        # legacy fields so existing downstream code keeps working while
-        # downstream renderers can switch to the canonical shape.
-        case_uid = _build_case_uid(patient.get("PMID"), patient.get("case_index_in_article"))
+            PMCID = patient["file_path"].split("/")[-1][3:-4]
+            if (i == 0) or (patients_out[i - 1]["patient_uid"].split("-")[0] != PMCID):
+                index = "1"
+            else:
+                index = str(int(patients_out[i - 1]["patient_uid"].split("-")[1]) + 1)
+            patient_uid = PMCID + "-" + index
+            # Schema-conformant case_uid (case_schema_v0.1.json) — strictly PMID-based.
+            case_uid = _build_case_uid(patient.get("PMID"), patient.get("case_index_in_article"))
         license_norm = _normalize_license(patient.get("license"))
         age_years = _age_to_years(patient["age"])
         sex = _normalize_sex(patient["gender"])
