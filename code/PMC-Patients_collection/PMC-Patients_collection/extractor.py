@@ -157,6 +157,249 @@ def hier_parse(body):
                 results[-1].append(subsec)
     return results[1:-1]
 
+
+# ════════════════════════════════════════════════════════════════════════
+# Scraped-journal extraction (Stage 0, non-PMC sources)
+# ════════════════════════════════════════════════════════════════════════
+# extract() above consumes PMC XML, which PMC normalizes to the NLM DTD with a
+# semantic <sec><title>Case Report</title> that opens with the patient. Our 4
+# scraped journals are native HTML/PDF with no such marker (validated: only RAD
+# exposes a "Caso clinico" heading; TurkJDerm uses opaque <div id="s1"> or is
+# abstract-only for older imports; ODermatol uses generic INTRODUCTION/RESULTS;
+# Acta APA PDFs have no headings).
+#
+# filters.py demo_filter (Stage A1) only reads the OPENING of patient_text and
+# expects it to begin with the patient ("A 45-year-old man presented ..."), the
+# way PMC's section extraction delivers it. So instead of fragile per-source
+# section isolation, we take the article body text and then "surgically open" it
+# at the first sentence carrying an age+sex cue — emulating what PMC's case
+# section yields. This is robust to front-matter noise (title/authors/abstract/
+# running headers) because the cue scan jumps past it.
+#
+# v1 scope: English sources only. Non-English (RAD = Spanish; some older
+# TurkJDerm = Turkish) are rejected as language_excluded — filters.py's age/sex
+# regex is English-only, so they yield ~0 and would only add noise. The
+# multilingual follow-up is tracked in the Stage 0 scraped-source PR.
+
+# Age+sex case-opening cue. Deliberately broader than a single form but far
+# simpler than filters.py's full age grammar — it only needs to locate WHERE the
+# patient narrative starts; filters.py does the authoritative parse afterward.
+_CASE_OPEN_CUE = re.compile(
+    r'\b('
+    r'\d{1,3}[\s\-]?(?:year|yr|month|week|day)[\s\-]?old'          # 45-year-old
+    r'|(?:aged|age)\s+\d{1,3}'                                      # aged 45
+    r'|in\s+(?:his|her)\s+(?:early\s+|late\s+)?\d0s'                # in his late 40s
+    r'|(?:man|woman|male|female|boy|girl|patient|infant|baby|child|neonate)'
+    r'\s+(?:aged|of)\s+\d{1,3}'                                     # woman aged 45
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def _surgical_open(text):
+    """Return text starting at the first sentence containing an age+sex case-opening
+    cue (to end of body). Falls back to the full text if no cue is found — those
+    will typically be rejected by demo_filter, which is correct for non-cases."""
+    if not text:
+        return ""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    for i, s in enumerate(sentences):
+        if _CASE_OPEN_CUE.search(s):
+            return " ".join(sentences[i:]).strip()
+    return text
+
+
+def _scraped_clean(text):
+    """Collapse whitespace + strip. Same intent as clean_text() in xml_utils."""
+    return re.sub(r"\s+", " ", text).strip() if text else ""
+
+
+def _scraped_body_text(record):
+    """Get the article body text per source (minimal source-specific code — the
+    surgical-open step handles front-matter, so we only need the main content
+    container, not precise section isolation)."""
+    source = record.get("source", "")
+    html_path = record.get("html_path", "")
+    pdf_path = record.get("pdf_path", "")
+
+    if source == "acta_apa":
+        return _scraped_pdf_text(pdf_path)
+
+    if html_path and os.path.isfile(html_path):
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(open(html_path, encoding="utf-8").read(), "lxml")
+        if source == "turkjderm":
+            container = soup.find("div", class_="article") or soup.find(id="content") or soup
+        elif source == "odermatol":
+            container = soup.find("div", class_="post-content") or soup
+        else:  # rad_argentina or unknown -> the saved fulltext is the content body
+            container = soup
+        text = _scraped_clean(container.get_text(" ", strip=True))
+        # For TurkJDerm older imports the HTML is abstract-only; fall back to PDF
+        # text when the HTML body is too short to contain a case.
+        if source == "turkjderm" and len(text.split()) < 120 and pdf_path:
+            pdf_text = _scraped_pdf_text(pdf_path)
+            if len(pdf_text.split()) > len(text.split()):
+                return pdf_text
+        return text
+
+    return _scraped_pdf_text(pdf_path) if pdf_path else ""
+
+
+def _scraped_pdf_text(pdf_path):
+    """Whole-PDF text via PyMuPDF (born-digital PDFs — no OCR). surgical-open
+    handles the title/author/header preamble downstream."""
+    if not pdf_path or not os.path.isfile(pdf_path):
+        return ""
+    import fitz  # PyMuPDF
+    doc = fitz.open(pdf_path)
+    text = "\n".join(page.get_text("text") for page in doc)
+    doc.close()
+    return _scraped_clean(text)
+
+
+def _scraped_load_figures(manifest_path):
+    """Translate our images/manifest.json into the figures[] shape that
+    extract_article_figures() emits for PMC: {fig_id, label, label_number,
+    caption, panels}. Only captioned entries are kept (rephrase.py criterion 5
+    needs the caption text)."""
+    if not manifest_path or not os.path.isfile(manifest_path):
+        return []
+    try:
+        manifest = json.loads(open(manifest_path, encoding="utf-8").read())
+    except Exception:
+        return []
+    figs = []
+    for img in manifest:
+        if not img.get("caption"):
+            continue
+        figs.append({
+            "fig_id": img.get("filename", ""),
+            "label": img.get("figure_label", ""),
+            "label_number": img.get("figure_number"),
+            "caption": img.get("caption", ""),
+            "panels": [],
+        })
+    return figs
+
+
+def _scraped_extract_tables(html_path):
+    """Walk <table> in saved HTML -> same shape as extract_article_tables() for
+    PMC: {table_id, label, label_number, caption, structured_rows}. Acta APA
+    (PDF-only) returns []."""
+    if not html_path or not os.path.isfile(html_path):
+        return []
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(open(html_path, encoding="utf-8").read(), "lxml")
+    out = []
+    for tnum, tbl in enumerate(soup.find_all("table"), start=1):
+        rows = []
+        for tr in tbl.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            if cells:
+                rows.append(cells)
+        if not rows:
+            continue
+        cap_el = tbl.find("caption")
+        out.append({
+            "table_id": tbl.get("id", ""),
+            "label": f"Table {tnum}",
+            "label_number": tnum,
+            "caption": cap_el.get_text(" ", strip=True) if cap_el else "",
+            "structured_rows": rows,
+        })
+    return out
+
+
+"""
+    Scraped-journal extractor — sibling of extract().
+    Same 6-tuple return shape and same patient-dict schema; reads a scraped
+    metadata record + saved PDF/HTML instead of PMC XML. One case per article
+    for v1 (our journals publish predominantly single-case reports).
+    Input:  (record_dict, scraped_root)
+    Output: (article_count, case_report_type_count, patient_count, error_count,
+             patients, article_reject)
+"""
+def extract_scraped_article(msg):
+    record, _scraped_root = msg
+    article_count = 0
+    case_report_type_count = 0
+    patient_count = 0
+    error_count = 0
+    patients = []
+    article_tables = []
+    article_figures = []
+
+    file_path = record.get("html_path") or record.get("pdf_path") or ""
+    journal_name = record.get("journal", "")
+    source = record.get("source", "")
+    raw_license = record.get("license", "")
+    license_canonical = SCRAPED_LICENSE_MAP.get(raw_license, raw_license)
+    doi_or_id = record.get("doi", "") or record.get("journal_article_id", "")
+
+    def finalize(reject_reason=None):
+        n = len(patients)
+        for i, p in enumerate(patients):
+            p["cases_in_article"] = n
+            p["case_index_in_article"] = i + 1
+            p["tables"] = article_tables
+            p["figures"] = article_figures
+        article_reject = ({"PMID": "", "file_path": file_path, "doi": doi_or_id,
+                           "source": source, "stage": "extractor_stage0_scraped",
+                           "reason": reject_reason}
+                          if reject_reason is not None else None)
+        return article_count, case_report_type_count, patient_count, error_count, patients, article_reject
+
+    # Stage A license filter (same allowlist as PMC, after normalization).
+    if license_canonical not in ALLOWED_LICENSES:
+        return finalize("license_excluded")
+
+    # Language gate (v1: English only). Our scrape tags language reliably per
+    # journal; filters.py's age/sex regex is English-only so non-English yields ~0.
+    if (record.get("language", "") or "").lower() != "en":
+        return finalize("language_excluded")
+
+    # Journal allowlist (reuse PMC-path gate + module-level state).
+    if not _journal_is_allowlisted(journal_name):
+        return finalize("journal_not_allowlisted")
+
+    article_count += 1
+    article_type = record.get("article_type", "") or record.get("article_type_raw", "")
+    if article_type == "case_report":
+        case_report_type_count += 1
+
+    try:
+        body = _scraped_body_text(record)
+        patient_text = _surgical_open(body)
+    except Exception as e:
+        error_count += 1
+        return finalize(f"text_extraction_error:{type(e).__name__}")
+
+    if not patient_text:
+        error_count += 1
+        return finalize("no_patient_text")
+
+    article_figures = _scraped_load_figures(record.get("images_manifest_path", ""))
+    article_tables = _scraped_extract_tables(record.get("html_path", ""))
+
+    patients.append({
+        "title": record.get("title", ""),
+        "journal": journal_name,
+        "file_path": file_path,
+        "PMID": "",
+        "pmcid": "",
+        "publication_date": record.get("published_date", ""),
+        "license": license_canonical,
+        "patient": patient_text,
+        "article_type": article_type,
+    })
+    stamp(patients[-1], "extractor_stage0_scraped", "kept",
+          journal=journal_name, license=license_canonical, source=source)
+    patient_count += 1
+    return finalize()
+
+
+
 """
     Extractor.
     Input:
