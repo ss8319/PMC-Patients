@@ -24,6 +24,43 @@ ALLOWED_LICENSES = {"CC BY", "CC BY-SA", "CC BY-NC", "CC BY-NC-SA", "CC0"}
 JOURNAL_DERM_PATTERNS: list = []
 JOURNAL_ADJACENT: set = set()
 
+# Case-section detection patterns. Module-level so they exist on any import path
+# (not just the Linux-fork PMC worker) and can be reused by the scraped-journal
+# extractor below. Previously defined inside __main__; hoisting also fixes a latent
+# bug where spawn-based (non-Linux) workers re-import the module without running
+# __main__ and would see these as undefined.
+# Section_title_trigger, such as "case report", "patient representation", etc.
+title_pattern = re.compile(r'(clinical )?((patient)|(case))(( ((illustrations?)|(report)|(descriptions?)|(information)|(details)|(discussions?)|((re)?presentation))([^a-z]|$))|$)')
+# Detect and further remove label in title such as "3.1" in "3.1 case one"
+label_pattern = re.compile(r'^[0-9]\.?[0-9]?\.?[0-9]?\.? ?')
+# Multi_patient_trigger, for paragraphs staring with "Case 1" and "The first patient", respectively
+case_1_pattern = re.compile(r'^(clinical )?((patient)|(case))( ((illustration)|(report)|(description)|(information)|(details)|(discussion)|((re)?presentation)))?.?\(?(([0-9]{1,2})|([abcde])|(i{1,3}|(i?vi?))|((one)|(two)|(three)|(four)|(five)))\)?($|[^a-z])')
+first_pattern = re.compile(r'^((the)|(our)) ((first)|(second)|(third)|(fourth)|(fifth)|(sixth)|(seventh)|(eighth)|(nineth)|(1-?st)|(2-?nd)|(3-?rd)|([456789]-?th)) ((case)|(patient))')
+
+# License normalization: our scraped data uses "CC-BY-4.0" / "CC-BY-NC-4.0" etc.;
+# PMC XML uses "CC BY" / "CC BY-NC". Normalize scraped values before gating against
+# ALLOWED_LICENSES so the same allowlist governs both pipelines.
+SCRAPED_LICENSE_MAP = {
+    "CC-BY-4.0":       "CC BY",
+    "CC-BY-SA-4.0":    "CC BY-SA",
+    "CC-BY-NC-4.0":    "CC BY-NC",
+    "CC-BY-NC-SA-4.0": "CC BY-NC-SA",
+    "CC0-1.0":         "CC0",
+    "CC0":             "CC0",
+}
+
+# Spanish case-section heading patterns (RAD Argentina). Layered on top of
+# title_pattern (English) — keeps the original untouched.
+SPANISH_TITLE_PATTERN = re.compile(
+    r'(caso cl[ií]nico|reporte de caso|presentaci[oó]n del caso|'
+    r'descripci[oó]n del caso|relato de caso|caso cl[ií]nico patol[oó]gico)'
+)
+
+# Fallback journal allowlist when journal_config.json isn't reachable (e.g. running
+# the scraped path on a machine without the DermArena repo). Our 4 scraped journals
+# all contain "dermat"; not a substitute for the full curated config on PMC sweeps.
+_DEFAULT_DERM_PATTERNS = ["dermat", "skin"]
+
 
 def _normalize_journal(s):
     if not s:
@@ -363,15 +400,8 @@ if __name__ == "__main__":
         flush=True,
     )
 
-    # Section_title_trigger, such as "case report", "patient representation", etc.
-    title_pattern = re.compile(r'(clinical )?((patient)|(case))(( ((illustrations?)|(report)|(descriptions?)|(information)|(details)|(discussions?)|((re)?presentation))([^a-z]|$))|$)')
-    # Detect and further remove label in title such as "3.1" in "3.1 case one"
-    label_pattern = re.compile(r'^[0-9]\.?[0-9]?\.?[0-9]?\.? ?')
-    # Multi_patient_trigger, for paragraphs staring with "Case 1" and "The first patient", respectively
-    case_1_pattern = re.compile(r'^(clinical )?((patient)|(case))( ((illustration)|(report)|(description)|(information)|(details)|(discussion)|((re)?presentation)))?.?\(?(([0-9]{1,2})|([abcde])|(i{1,3}|(i?vi?))|((one)|(two)|(three)|(four)|(five)))\)?($|[^a-z])')
-    first_pattern = re.compile(r'^((the)|(our)) ((first)|(second)|(third)|(fourth)|(fifth)|(sixth)|(seventh)|(eighth)|(nineth)|(1-?st)|(2-?nd)|(3-?rd)|([456789]-?th)) ((case)|(patient))')
-    # Convert several white space character into " "
-    space = r"[\u3000\u2009\u2002\u2003\u00a0\u200a\xa0]"
+    # Case-section patterns (title_pattern, label_pattern, case_1_pattern,
+    # first_pattern) are now defined at module level \u2014 see top of file.
 
     data_dir = str(args.data_dir)
     meta_csv = args.meta_csv
